@@ -1,0 +1,113 @@
+# Unified compose for the dockerized pipeline. Brings up resolver, the audio
+# STT server, the audio stream client, and the collector (as a one-shot job).
+#
+# Network choice: `network_mode: host`. The existing collector-redpanda
+# advertises itself as `localhost:9092` (set in ~/collector/docker-compose.yml),
+# which only works for clients that share the host's loopback. Bridge-network
+# clients receive that metadata and try 127.0.0.1 inside their own namespace —
+# which fails. Host networking is the lowest-risk fix here: it avoids
+# recreating the running redpanda (no persistent volume, 11d uptime), and the
+# new services don't bind any port the host already uses.
+#
+# Coexistence:
+#   - `backend` already owns host :8000 — audio-stt is moved to :8001.
+#   - `ollama serve` on host owns :11434 — resolver doesn't bind ports.
+#   - `cloudflared tunnel` owns nothing local — untouched.
+#   - `collector-redpanda` owns :9092 — untouched.
+#   - `redpanda-console` (kafka UI) gets :8088.
+
+volumes:
+  resolver_data:
+  collector_data:
+  whisper_cache:
+
+services:
+  resolver:
+    build:
+      context: ../resolver
+    image: pipeline/resolver:latest
+    container_name: resolver
+    network_mode: host
+    env_file: ../resolver/.env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      KAFKA_AUDIO_TOPIC: audio_transcripts
+      LOG_LEVEL: INFO
+    volumes:
+      - resolver_data:/data
+    restart: unless-stopped
+
+  audio-stt:
+    build:
+      context: ../audio_processing
+      dockerfile: Dockerfile.stt
+    image: pipeline/audio-stt:latest
+    container_name: audio-stt
+    network_mode: host
+    environment:
+      STT_PORT: 8001
+      LOG_LEVEL: INFO
+    volumes:
+      - whisper_cache:/cache
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import urllib.request,sys; urllib.request.urlopen(\"http://localhost:8001/docs\", timeout=3); sys.exit(0)' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 90s
+
+  audio-client:
+    build:
+      context: ../audio_processing
+      dockerfile: Dockerfile.client
+    image: pipeline/audio-client:latest
+    container_name: audio-client
+    network_mode: host
+    depends_on:
+      audio-stt:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      KAFKA_OUTPUT_TOPIC: audio_transcripts
+      STT_API_URL: http://localhost:8001/transcribe
+      LOG_LEVEL: INFO
+    restart: unless-stopped
+
+  kafka-ui:
+    image: docker.redpanda.com/redpandadata/console:latest
+    container_name: kafka-ui
+    network_mode: host
+    environment:
+      # Console listens on this port; the broker is on host :9092.
+      CONFIG_FILEPATH: /tmp/console.yaml
+      SERVER_LISTENPORT: 8088
+      KAFKA_BROKERS: localhost:9092
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        cat > /tmp/console.yaml <<'EOF'
+        kafka:
+          brokers: ["localhost:9092"]
+        server:
+          listenPort: 8088
+        EOF
+        exec /app/console
+    restart: unless-stopped
+
+  collector:
+    build:
+      context: ../collector
+    image: pipeline/collector:latest
+    container_name: collector
+    network_mode: host
+    env_file: ../collector/.env
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: localhost:9092
+      DEDUP_DB_PATH: /data/dedup.sqlite
+      LOG_LEVEL: INFO
+    volumes:
+      - collector_data:/data
+    profiles: ["oneshot"]
+    restart: "no"
