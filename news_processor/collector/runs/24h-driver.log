@@ -1,7 +1,0 @@
-[reset] removing /Users/khangl/Workspace/collector/dedup.sqlite
-[reset] recreating topic 'articles'
-TOPIC     STATUS
-articles  OK
-TOPIC     STATUS
-articles  OK
-[run 1/96] starting
